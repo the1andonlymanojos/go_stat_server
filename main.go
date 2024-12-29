@@ -170,7 +170,18 @@ func getServerMetrics() (ServerMetrics, error) {
 		log.Printf("Error getting disk usage: %v", err)
 	}
 
-	network, err := net.IOCounters(false)
+	stats, err := net.IOCounters(true)
+	// filter only required interface
+	var network []net.IOCountersStat
+	for _, stat := range stats {
+		if stat.Name == "enp5s0" {
+			network = append(network, stat)
+		}
+	}
+	if len(network) == 0 {
+		log.Printf("Error getting network stats: %v", "No network interface found")
+	}
+	monitorNetworkSpeed(1*time.Second, "enp5s0")
 	if err != nil {
 		log.Printf("Error getting network stats: %v", err)
 	}
@@ -180,29 +191,6 @@ func getServerMetrics() (ServerMetrics, error) {
 	metrics.CPUUsage = cpuUsage
 	metrics.Network = network
 	return metrics, nil
-}
-
-func getNetworkBytes() (uint64, uint64) {
-	data, err := os.ReadFile("/proc/net/dev")
-	if err != nil {
-		return 0, 0
-	}
-
-	var txBytes, rxBytes uint64
-	lines := strings.Split(string(data), "\n")
-
-	for _, line := range lines[2:] {
-		fields := strings.Fields(line)
-		if len(fields) < 9 {
-			continue
-		}
-		rx, _ := strconv.ParseUint(fields[1], 10, 64)
-		tx, _ := strconv.ParseUint(fields[9], 10, 64)
-		rxBytes += rx
-		txBytes += tx
-	}
-
-	return txBytes, rxBytes
 }
 
 func loadUptime() {
@@ -273,6 +261,45 @@ func encodeMetrics(metrics Metrics) string {
 		return ""
 	}
 	return base64.StdEncoding.EncodeToString(jsonData)
+}
+
+func monitorNetworkSpeed(interval time.Duration, interfaceName string) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var prevTx, prevRx uint64
+
+	for {
+		select {
+		case <-ticker.C:
+			// Get current stats
+			stats, err := net.IOCounters(true)
+			if err != nil {
+				fmt.Println("Error:", err)
+				return
+			}
+
+			var currentTx, currentRx uint64
+			for _, stat := range stats {
+				if stat.Name == interfaceName {
+					currentTx = stat.BytesSent
+					currentRx = stat.BytesRecv
+					break
+				}
+			}
+
+			if prevTx != 0 && prevRx != 0 {
+				// Calculate rate
+				txRate := float64(currentTx-prevTx) / interval.Seconds() * 8 / 1024 / 1024 // Mbps
+				rxRate := float64(currentRx-prevRx) / interval.Seconds() * 8 / 1024 / 1024 // Mbps
+				fmt.Printf("Tx: %.2f Mb/s, Rx: %.2f Mb/s\n", txRate, rxRate)
+			}
+
+			// Update previous stats
+			prevTx = currentTx
+			prevRx = currentRx
+		}
+	}
 }
 
 //	func handleMetrics(w http.ResponseWriter, r *http.Request) {
