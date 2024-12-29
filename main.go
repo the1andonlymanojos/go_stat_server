@@ -4,6 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/disk"
+	"github.com/shirou/gopsutil/mem"
+	"github.com/shirou/gopsutil/net"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -23,12 +27,10 @@ type Metrics struct {
 }
 
 type ServerMetrics struct {
-	CPUUsage     string   `json:"cpu_usage"`
-	MemoryUsage  string   `json:"memory_usage"`
-	DiskUsage    []string `json:"disk_usage"`
-	NetworkUsage string   `json:"network_usage"`
-	TXBytes      uint64   `json:"tx_bytes"`
-	RXBytes      uint64   `json:"rx_bytes"`
+	CPUUsage []float64              `json:"cpu_usage"`
+	Memory   *mem.VirtualMemoryStat `json:"memory"`
+	Disk     *disk.UsageStat        `json:"disk"`
+	Network  []net.IOCountersStat   `json:"network"`
 }
 
 type KubernetesMetrics struct {
@@ -153,54 +155,30 @@ func collectMetrics() (Metrics, error) {
 }
 
 func getServerMetrics() (ServerMetrics, error) {
-	var wg sync.WaitGroup
-	results := make(chan struct {
-		key   string
-		value string
-	}, 4)
-
-	commands := map[string]string{
-		"cpuUsage":     "mpstat 1 1 | awk '/Average/ {print 100 - $NF}'",
-		"memoryUsage":  "free -h | awk '/Mem:/ {print $3 \" / \" $2}'",
-		"diskUsage":    "(df -h --output=source,size,used,avail,pcent | awk '$1 == \"/dev/sdb5\" {printf \"%s: %s/%sB\\n\", $1, substr($3, 1, length($3)-1), $2}'                             \n  zpool list -v | awk '            \n  $1 == \"mypool\" || $1 == \"vault\" {\n      split($2, total, \"([TGMK])\")\n      split($3, used, \"([TGMK])\")\n      if (used[1] >= 50)                               \n          printf \"%s: %s/%sGB\\n\", $1, used[1], total[1]\n  }'                                                                                                                                                        \n)\n  ",
-		"networkStats": "ifstat -i enp5s0 1 1 | awk 'NR==3 {print $1, $2}'",
+	cpuUsage, err := cpu.Percent(1, false)
+	if err != nil {
+		log.Printf("Error getting CPU usage: %v", err)
 	}
 
-	for key, cmd := range commands {
-		wg.Add(1)
-		go func(key, cmd string) {
-			defer wg.Done()
-			output, _ := runCommand(cmd)
-			results <- struct {
-				key   string
-				value string
-			}{key, strings.TrimSpace(output)}
-		}(key, cmd)
+	memory, err := mem.VirtualMemory()
+	if err != nil {
+		log.Printf("Error getting memory stats: %v", err)
 	}
 
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	diskUsage, err := disk.Usage("/srv/nfs/shared")
+	if err != nil {
+		log.Printf("Error getting disk usage: %v", err)
+	}
 
+	network, err := net.IOCounters(false)
+	if err != nil {
+		log.Printf("Error getting network stats: %v", err)
+	}
 	metrics := ServerMetrics{}
-	for result := range results {
-		switch result.key {
-		case "cpuUsage":
-			metrics.CPUUsage = result.value
-		case "memoryUsage":
-			metrics.MemoryUsage = result.value
-		case "diskUsage":
-			metrics.DiskUsage = strings.Split(result.value, "\n")
-		case "networkStats":
-			metrics.NetworkUsage = result.value
-		}
-	}
-
-	txBytes, rxBytes := getNetworkBytes()
-	metrics.TXBytes = txBytes
-	metrics.RXBytes = rxBytes
-
+	metrics.Disk = diskUsage
+	metrics.Memory = memory
+	metrics.CPUUsage = cpuUsage
+	metrics.Network = network
 	return metrics, nil
 }
 
