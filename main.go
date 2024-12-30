@@ -116,13 +116,15 @@ func handleShutdown(w http.ResponseWriter, r *http.Request) {
 func startMetricsUpdater() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
+	fmt.Println("Here 1")
 	for range ticker.C {
+		fmt.Println("Here 2")
 		metrics, err := collectMetrics()
 		if err != nil {
 			fmt.Println("Failed to update metrics:", err)
 			continue
 		}
+		fmt.Println(metrics)
 
 		mu.Lock()
 		metrics.TimeLeft = countdown
@@ -139,6 +141,7 @@ func startMetricsUpdater() {
 func collectMetrics() (Metrics, error) {
 	serverMetrics, err := getServerMetrics()
 	if err != nil {
+		fmt.Println(err)
 		return Metrics{}, err
 	}
 
@@ -170,17 +173,8 @@ func getServerMetrics() (ServerMetrics, error) {
 		log.Printf("Error getting disk usage: %v", err)
 	}
 
-	stats, err := net.IOCounters(true)
-	// filter only required interface
-	var network []net.IOCountersStat
-	for _, stat := range stats {
-		if stat.Name == "enp5s0" {
-			network = append(network, stat)
-		}
-	}
-	if len(network) == 0 {
-		log.Printf("Error getting network stats: %v", "No network interface found")
-	}
+	fmt.Println("Here 3")
+
 	monitorNetworkSpeed(1*time.Second, "enp5s0")
 	if err != nil {
 		log.Printf("Error getting network stats: %v", err)
@@ -189,7 +183,6 @@ func getServerMetrics() (ServerMetrics, error) {
 	metrics.Disk = diskUsage
 	metrics.Memory = memory
 	metrics.CPUUsage = cpuUsage
-	metrics.Network = network
 	return metrics, nil
 }
 
@@ -266,17 +259,33 @@ func encodeMetrics(metrics Metrics) string {
 func monitorNetworkSpeed(interval time.Duration, interfaceName string) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
+	writeInterval := 5
 	var prevTx, prevRx uint64
+	var cumulativeTx, cumulativeRx float64
+	counter := 0
+
+	// Load existing totals from the log file
+	file := "network.log"
+	if data, err := os.ReadFile(file); err == nil {
+		lines := strings.Split(string(data), "\n")
+		if len(lines) > 1 {
+			timestamp := ""
+			fmt.Sscanf(lines[len(lines)-2], "%s - Tx: %f Mb, Rx: %f Mb", &timestamp, &cumulativeTx, &cumulativeRx)
+
+			fmt.Println(lines[len(lines)-2])
+
+			fmt.Println("found: ", cumulativeTx, cumulativeRx)
+		}
+	}
 
 	for {
 		select {
 		case <-ticker.C:
-			// Get current stats
+			// Get current stats for the specified interface
 			stats, err := net.IOCounters(true)
 			if err != nil {
-				fmt.Println("Error:", err)
-				return
+				log.Printf("Error getting network stats: %v", err)
+				continue
 			}
 
 			var currentTx, currentRx uint64
@@ -288,11 +297,32 @@ func monitorNetworkSpeed(interval time.Duration, interfaceName string) {
 				}
 			}
 
-			if prevTx != 0 && prevRx != 0 {
-				// Calculate rate
+			if currentTx == 0 && currentRx == 0 {
+				log.Printf("No stats found for interface: %s", interfaceName)
+				continue
+			}
+
+			//Calculate and display current rates if previous values exist
+			if prevTx > 0 && prevRx > 0 {
 				txRate := float64(currentTx-prevTx) / interval.Seconds() * 8 / 1024 / 1024 // Mbps
 				rxRate := float64(currentRx-prevRx) / interval.Seconds() * 8 / 1024 / 1024 // Mbps
-				fmt.Printf("Tx: %.2f Mb/s, Rx: %.2f Mb/s\n", txRate, rxRate)
+				// Update cumulative totals
+				cumulativeTx += float64(currentTx-prevTx) / 1024 / 1024 //in MB
+				cumulativeRx += float64(currentRx-prevRx) / 1024 / 1024 //in MB
+				counter++
+				fmt.Println(txRate, rxRate)
+			}
+
+			if counter >= writeInterval {
+				// Save updated totals to the log file
+				timestamp := time.Now().Format(time.RFC3339)
+				entry := fmt.Sprintf("%s - Tx: %.2f MB, Rx: %.2f MB\n", timestamp, cumulativeTx, cumulativeRx)
+				fmt.Println(entry)
+				err = os.WriteFile(file, []byte(entry), 0644)
+				if err != nil {
+					log.Printf("Error writing to file: %v", err)
+				}
+				counter = 0
 			}
 
 			// Update previous stats
