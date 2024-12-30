@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/disk"
 	"github.com/shirou/gopsutil/mem"
 	"github.com/shirou/gopsutil/net"
@@ -20,17 +19,31 @@ import (
 )
 
 type Metrics struct {
-	Server     ServerMetrics     `json:"server"`
-	Kubernetes KubernetesMetrics `json:"kubernetes"`
-	TimeLeft   int64             `json:"time_left"`
-	Uptime     string            `json:"uptime"`
+	Server ServerMetrics `json:"server"`
+	//	Kubernetes KubernetesMetrics `json:"kubernetes"`
+	TimeLeft int64 `json:"time_left"`
+	//	Uptime     string            `json:"uptime"`
 }
 
 type ServerMetrics struct {
-	CPUUsage []float64              `json:"cpu_usage"`
-	Memory   *mem.VirtualMemoryStat `json:"memory"`
-	Disk     *disk.UsageStat        `json:"disk"`
-	Network  []net.IOCountersStat   `json:"network"`
+	LoadAvg        LoadAvg       `json:"load_avg"`
+	Memory         MemoryStat    `json:"memory"`
+	TotalDiskSpace float64       `json:"total_disk_space"`
+	UsedDiskSpace  float64       `json:"used_disk_space"`
+	NetworkStats   NetworkStats  `json:"network_stats"`
+	UptimeMetrics  UptimeMetrics `json:"uptime_metrics"`
+}
+
+type MemoryStat struct {
+	Total uint64 `json:"total"`
+	Used  uint64 `json:"used"`
+}
+
+type NetworkStats struct {
+	TxRate  float64 `json:"tx_rate"`
+	RxRate  float64 `json:"rx_rate"`
+	TxBytes uint64  `json:"tx_bytes"`
+	RxBytes uint64  `json:"rx_bytes"`
 }
 
 type KubernetesMetrics struct {
@@ -40,15 +53,25 @@ type KubernetesMetrics struct {
 	ErrorRates string `json:"error_rates"`
 }
 
+type UptimeMetrics struct {
+	Uptime   string `json:"uptime"`
+	IdleTime string `json:"idle_time"`
+}
+
 var (
 	currentMetrics Metrics
 	metricsMu      sync.RWMutex
 
+	currentNetworkMetrics NetworkStats
+	networkMu             sync.RWMutex
+
+	currentUptimeMetrics UptimeMetrics
+	uptimeMu             sync.RWMutex
+
 	countdown int64
 	mu        sync.Mutex
 
-	totalUptimeSeconds int64
-	uptimeFile         = "uptime.log"
+	uptimeFile = "uptime.log"
 )
 
 func main() {
@@ -56,10 +79,10 @@ func main() {
 	http.HandleFunc("/shutdown", handleShutdown)
 	fmt.Println(countdown)
 	countdown = -1
-	loadUptime()
 	go startMetricsUpdater()
 	go manageCountdown()
-
+	go monitorNetworkSpeed(1*time.Second, "enp5s0")
+	go monitorUptime(1 * time.Second)
 	go func() {
 		log.Println("Starting pprof server on :6060")
 		log.Fatal(http.ListenAndServe("localhost:6060", nil)) // pprof will be available here
@@ -75,6 +98,17 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	metricsMu.RLock()
 	metrics := currentMetrics
 	metricsMu.RUnlock()
+
+	networkMu.RLock()
+	networkStats := currentNetworkMetrics
+	networkMu.RUnlock()
+
+	uptimeMu.RLock()
+	uptimeStats := currentUptimeMetrics
+	uptimeMu.RUnlock()
+
+	metrics.Server.NetworkStats = networkStats
+	metrics.Server.UptimeMetrics = uptimeStats
 
 	encodedMetrics := encodeMetrics(metrics)
 	w.Header().Set("Content-Type", "application/json")
@@ -134,7 +168,6 @@ func startMetricsUpdater() {
 		currentMetrics = metrics
 		metricsMu.Unlock()
 
-		incrementUptime()
 	}
 }
 
@@ -145,62 +178,137 @@ func collectMetrics() (Metrics, error) {
 		return Metrics{}, err
 	}
 
-	kubernetesMetrics, err := getKubernetesMetrics()
-	if err != nil {
-		return Metrics{}, err
-	}
+	//kubernetesMetrics, err := getKubernetesMetrics()
 
 	return Metrics{
-		Server:     serverMetrics,
-		Kubernetes: kubernetesMetrics,
-		Uptime:     fmt.Sprintf("%d seconds", totalUptimeSeconds),
+		Server: serverMetrics,
+		//Kubernetes: kubernetesMetrics,
 	}, nil
 }
 
-func getServerMetrics() (ServerMetrics, error) {
-	cpuUsage, err := cpu.Percent(1, false)
+// LoadAvg represents the data from /proc/loadavg
+type LoadAvg struct {
+	Load1           float64 // 1-minute load average
+	Load5           float64 // 5-minute load average
+	Load15          float64 // 15-minute load average
+	ActiveProcesses int     // Number of active (running) processes
+	TotalProcesses  int     // Total number of processes
+	LastPID         int     // Last created process ID
+}
+
+func ReadLoadAvg() (LoadAvg, error) {
+	// Read the /proc/loadavg file
+	data, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
-		log.Printf("Error getting CPU usage: %v", err)
+		_ = fmt.Errorf("failed to read /proc/loadavg: %v", err)
+	}
+
+	// Split the content into fields
+	fields := strings.Fields(string(data))
+	if len(fields) < 5 {
+		_ = fmt.Errorf("unexpected format in /proc/loadavg")
+	}
+
+	// Parse the load averages
+	load1, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		_ = fmt.Errorf("failed to parse 1-minute load average: %v", err)
+	}
+
+	load5, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		_ = fmt.Errorf("failed to parse 5-minute load average: %v", err)
+	}
+
+	load15, err := strconv.ParseFloat(fields[2], 64)
+	if err != nil {
+		_ = fmt.Errorf("failed to parse 15-minute load average: %v", err)
+	}
+
+	// Parse the active/total process count
+	processInfo := strings.Split(fields[3], "/")
+	if len(processInfo) != 2 {
+		_ = fmt.Errorf("unexpected format for process info: %s", fields[3])
+	}
+
+	activeProcesses, err := strconv.Atoi(processInfo[0])
+	if err != nil {
+		_ = fmt.Errorf("failed to parse active process count: %v", err)
+	}
+
+	totalProcesses, err := strconv.Atoi(processInfo[1])
+	if err != nil {
+		_ = fmt.Errorf("failed to parse total process count: %v", err)
+	}
+
+	// Parse the last PID
+	lastPID, err := strconv.Atoi(fields[4])
+	if err != nil {
+		_ = fmt.Errorf("failed to parse last PID: %v", err)
+	}
+
+	// Populate the LoadAvg struct
+	loadAvg := LoadAvg{
+		Load1:           load1,
+		Load5:           load5,
+		Load15:          load15,
+		ActiveProcesses: activeProcesses,
+		TotalProcesses:  totalProcesses,
+		LastPID:         lastPID,
+	}
+
+	return loadAvg, nil
+}
+func getServerMetrics() (ServerMetrics, error) {
+	loadAvg, err := ReadLoadAvg()
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
 	}
 
 	memory, err := mem.VirtualMemory()
+
+	// Actual used memory = Used - Cached - Buffers
+	actualUsedMemory := float64(memory.Used) - float64(memory.Cached) - float64(memory.Buffers)
+
+	// Convert memory to GB
+	actualUsedMemoryGB := actualUsedMemory / (1024 * 1024 * 1024)     // Convert bytes to GB
+	availableMemoryGB := float64(memory.Total) / (1024 * 1024 * 1024) // Convert bytes to GB
+
+	// Print the stats
+	fmt.Printf("Actual Used Memory: %.2f GB\n", actualUsedMemoryGB)
+	fmt.Printf("Available Memory: %.2f GB\n", availableMemoryGB)
 	if err != nil {
 		log.Printf("Error getting memory stats: %v", err)
 	}
+	disks := []string{"/", "/srv/nfs/shared", "/mnt/vault"}
+	totalUsed := 0.0
+	totalDiskSpace := 0.0
+	for _, drive := range disks {
+		diskUsage, _ := disk.Usage(drive)
+		totalUsed += float64(diskUsage.Used) / (1024 * 1024 * 1024)       // Convert bytes to GB
+		totalDiskSpace += float64(diskUsage.Total) / (1024 * 1024 * 1024) // Convert bytes to GB
 
-	diskUsage, err := disk.Usage("/srv/nfs/shared")
+	}
+	//diskUsage1, err := disk.Usage("/srv/nfs/shared")
+	////find total and used disk space
+	//totalDiskSpace := float64(diskUsage1.Total) / (1024 * 1024 * 1024) // Convert bytes to GB
+	//usedDiskSpace := float64(diskUsage1.Used) / (1024 * 1024 * 1024)   // Convert bytes to GB
+	fmt.Println("Total disk space: ", totalDiskSpace)
+	fmt.Println("Used disk space: ", totalUsed)
 	if err != nil {
 		log.Printf("Error getting disk usage: %v", err)
 	}
 
 	fmt.Println("Here 3")
-
-	monitorNetworkSpeed(1*time.Second, "enp5s0")
-	if err != nil {
-		log.Printf("Error getting network stats: %v", err)
-	}
 	metrics := ServerMetrics{}
-	metrics.Disk = diskUsage
-	metrics.Memory = memory
-	metrics.CPUUsage = cpuUsage
+	metrics.TotalDiskSpace = totalDiskSpace
+	metrics.UsedDiskSpace = totalUsed
+	metrics.Memory = MemoryStat{
+		Total: uint64(availableMemoryGB),
+		Used:  uint64(actualUsedMemoryGB),
+	}
+	metrics.LoadAvg = loadAvg
 	return metrics, nil
-}
-
-func loadUptime() {
-	data, err := os.ReadFile(uptimeFile)
-	if err == nil {
-		totalUptimeSeconds, _ = strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
-	}
-}
-
-func incrementUptime() {
-	totalUptimeSeconds++
-	if totalUptimeSeconds%10 == 0 { // Save uptime every 10 seconds
-		err := os.WriteFile(uptimeFile, []byte(fmt.Sprintf("%d", totalUptimeSeconds)), 0644)
-		if err != nil {
-			return
-		}
-	}
 }
 
 func manageCountdown() {
@@ -270,7 +378,7 @@ func monitorNetworkSpeed(interval time.Duration, interfaceName string) {
 		lines := strings.Split(string(data), "\n")
 		if len(lines) > 1 {
 			timestamp := ""
-			fmt.Sscanf(lines[len(lines)-2], "%s - Tx: %f Mb, Rx: %f Mb", &timestamp, &cumulativeTx, &cumulativeRx)
+			fmt.Sscanf(lines[len(lines)-2], "%s - Tx: %f MB, Rx: %f MB", &timestamp, &cumulativeTx, &cumulativeRx)
 
 			fmt.Println(lines[len(lines)-2])
 
@@ -309,6 +417,17 @@ func monitorNetworkSpeed(interval time.Duration, interfaceName string) {
 				// Update cumulative totals
 				cumulativeTx += float64(currentTx-prevTx) / 1024 / 1024 //in MB
 				cumulativeRx += float64(currentRx-prevRx) / 1024 / 1024 //in MB
+				temp := NetworkStats{
+					TxRate:  txRate,
+					RxRate:  rxRate,
+					TxBytes: currentTx,
+					RxBytes: currentRx,
+				}
+
+				networkMu.Lock()
+				currentNetworkMetrics = temp
+				networkMu.Unlock()
+
 				counter++
 				fmt.Println(txRate, rxRate)
 			}
@@ -328,6 +447,75 @@ func monitorNetworkSpeed(interval time.Duration, interfaceName string) {
 			// Update previous stats
 			prevTx = currentTx
 			prevRx = currentRx
+		}
+	}
+}
+
+func monitorUptime(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	writeInterval := 5
+	counter := 0
+
+	// Load existing uptime and idle time from the log file
+	file := "uptime.log"
+	var cumulativeUptime, cumulativeIdleTime float64
+	if data, err := os.ReadFile(file); err == nil {
+		lines := strings.Split(string(data), "\n")
+		if len(lines) > 1 {
+			timestamp := ""
+			fmt.Sscanf(lines[len(lines)-2], "%s - Uptime: %f seconds, Idle: %f seconds", &timestamp, &cumulativeUptime, &cumulativeIdleTime)
+			fmt.Println(lines[len(lines)-2])
+			fmt.Println("found: ", cumulativeUptime, cumulativeIdleTime)
+		}
+	}
+
+	var prevUptime, prevIdleTime float64
+
+	for {
+		select {
+		case <-ticker.C:
+			// Read uptime and idle time from /proc/uptime
+			data, err := os.ReadFile("/proc/uptime")
+			if err != nil {
+				log.Printf("Error reading /proc/uptime: %v", err)
+				continue
+			}
+
+			var uptime, idleTime float64
+			fmt.Sscanf(string(data), "%f %f", &uptime, &idleTime)
+
+			// Update cumulative uptime and idle time by the delta
+			if prevUptime > 0 && prevIdleTime > 0 {
+				cumulativeUptime += uptime - prevUptime
+				cumulativeIdleTime += idleTime - prevIdleTime
+			}
+
+			// Update previous readings
+			prevUptime = uptime
+			prevIdleTime = idleTime
+
+			counter++
+			fmt.Println("Uptime:", uptime, "Idle:", idleTime)
+
+			uptimeMu.Lock()
+			currentUptimeMetrics = UptimeMetrics{
+				Uptime:   fmt.Sprintf("%.2f seconds", cumulativeUptime),
+				IdleTime: fmt.Sprintf("%.2f seconds", cumulativeIdleTime),
+			}
+			uptimeMu.Unlock()
+
+			if counter >= writeInterval {
+				// Save updated uptime and idle time to the log file
+				timestamp := time.Now().Format(time.RFC3339)
+				entry := fmt.Sprintf("%s - Uptime: %.2f seconds, Idle: %.2f seconds\n", timestamp, cumulativeUptime, cumulativeIdleTime)
+				fmt.Println(entry)
+				err = os.WriteFile(file, []byte(entry), 0644)
+				if err != nil {
+					log.Printf("Error writing to file: %v", err)
+				}
+				counter = 0
+			}
 		}
 	}
 }
